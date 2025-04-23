@@ -1,12 +1,16 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { envs } from 'src/config/envs';
 import Stripe from 'stripe';
 import { PaymentSessionDto } from './dto/payments.dto';
 import { Request, Response } from 'express';
+import { NATS_SERVICE } from 'src/config/services';
+import { ClientProxy } from '@nestjs/microservices';
 
 @Injectable()
 export class PaymentsService {
     private readonly stripe = new Stripe(envs.stripe_secret_key);
+
+    constructor(@Inject(NATS_SERVICE) private readonly client: ClientProxy) {}
 
     async createPaymentSession(paymentSessionDto: PaymentSessionDto) {
         const { currency, items, orderId } = paymentSessionDto;
@@ -33,11 +37,15 @@ export class PaymentsService {
             cancel_url: envs.stripe_cancel_url,
         });
 
-        return session;
+        return {
+            cancel_url: session.cancel_url,
+            success_url: session.success_url,
+            url: session.url,
+        };
     }
 
     stripeWebhook(req: Request, res: Response) {
-        const sig = req.headers['stripe-signature'] as string;
+        const signature = req.headers['stripe-signature'] as string;
         let event: Stripe.Event;
         const endpointSecret = envs.stripe_endpoint_secret;
 
@@ -45,7 +53,7 @@ export class PaymentsService {
             event = this.stripe.webhooks.constructEvent(
                 // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
                 req['rawBody'],
-                sig,
+                signature,
                 endpointSecret,
             );
         } catch (err) {
@@ -57,11 +65,22 @@ export class PaymentsService {
 
         switch (event.type) {
             case 'charge.succeeded':
-                console.log('Charge succeeded:', event.data.object);
+                // eslint-disable-next-line no-case-declarations
+                const chargeSucceeded = event.data.object;
+                // eslint-disable-next-line no-case-declarations
+                const payload = {
+                    stripePaymentId: chargeSucceeded.id,
+                    orderId: chargeSucceeded.metadata.orderId,
+                    receiptUrl: chargeSucceeded.receipt_url,
+                };
+
+                this.client.emit('payment.succeeded', payload);
                 break;
             default:
                 console.log(`Unhandled event type ${event.type}`);
                 break;
         }
+
+        return res.status(200).json({ signature });
     }
 }
